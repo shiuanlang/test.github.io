@@ -1,0 +1,19 @@
+# 金鑰與憑證（切勿提交）
+sinopac.json
+.env
+*.pfx
+*.crt
+*.pem
+*.key
+
+# 執行產生
+*.log
+__pycache__/
+*.pyc
+
+# 環境 / 編輯器
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store

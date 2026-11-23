@@ -494,12 +494,10 @@ def aggregate(bars, kind):
 
 def fetch_history(code, ex, tf):
     idx = code in ("t00", "o00")
-    intra = tf in ("rt", "5d", "5m", "15m", "60m")
-    order = []
-    if SJ and not idx and intra: order.append("sj")
-    order.append("yahoo")
-    if tf in ("D", "W", "M") and not idx: order.append("twse")
-    if SJ and not idx and not intra: order.append("sj")
+    # 永豐啟用時以永豐為主、Yahoo 為輔；指數或未啟用永豐時以 Yahoo 為主
+    order = ["sj", "yahoo"] if SJ and not idx else ["yahoo"]
+    if tf in ("D", "W", "M") and not idx:
+        order.append("twse")
     errs = []
     for name in order:
         try:
@@ -520,7 +518,7 @@ def get_history(code, ex, tf):
     if tf not in YF_MAP:
         raise ValueError("bad tf")
     key = (code, tf)
-    ttl = 15 if tf == "rt" else 120
+    ttl = 15 if tf == "rt" else (600 if SJ and tf in ("D", "W", "M") else 120)
     hit = _hcache.get(key)
     if hit and time.time() - hit[0] < ttl:
         return hit[1]

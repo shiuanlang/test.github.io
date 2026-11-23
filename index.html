@@ -189,14 +189,20 @@ function applyTheme(){
   r.style.setProperty('--dn',S.scheme==='tw'?grn:red);
 }
 
+/* ---------- 後端 API ---------- */
+async function api(u){
+  const r=await fetch(u);const t=await r.text();
+  try{return JSON.parse(t)}catch(e){
+    throw new Error('後端沒有回傳 JSON（HTTP '+r.status+'）。請用「python3 main.py」啟動，並開啟終端機顯示的網址（預設 http://127.0.0.1:8765/）；不要直接開 index.html、也不要用 Live Server 或其他靜態伺服器。')}
+}
+
 /* ---------- 報價輪詢 ---------- */
 let timer=null,status='';
 async function pollQuotes(){
   clearTimeout(timer);
   const codes=[...new Set([...st.watch.map(w=>w.code),'t00','o00',st.sel])];
   try{
-    const r=await fetch('/api/quote?codes='+codes.join(','));
-    const j=await r.json();
+    const j=await api('/api/quote?codes='+codes.join(','));
     if(j.error)throw new Error(j.error);
     applyQuotes(j.quotes);
     status='ok';
@@ -260,8 +266,7 @@ async function loadHistory(){
   try{
     const q=st.q[code],w=st.watch.find(x=>x.code===code);
     const ex=(q&&q.ex)||(w&&w.ex)||'';
-    const r=await fetch(`/api/history?code=${code}&ex=${ex}&tf=${tf}`);
-    const j=await r.json();
+    const j=await api(`/api/history?code=${code}&ex=${ex}&tf=${tf}`);
     if(tok!==histTok)return;
     if(j.error)throw new Error(j.error);
     st.bars=j.bars.map(b=>({t:b[0],o:b[1],h:b[2],l:b[3],c:b[4],v:b[5]}));
@@ -672,7 +677,7 @@ addIn.addEventListener('input',()=>{
   clearTimeout(sugT);
   sugT=setTimeout(async()=>{
     const v=addIn.value.trim();if(!v){sug.style.display='none';return}
-    try{const j=await(await fetch('/api/search?q='+encodeURIComponent(v))).json();sugRes=j.results||[];
+    try{const j=await api('/api/search?q='+encodeURIComponent(v));sugRes=j.results||[];
       sug.innerHTML=sugRes.map(r=>`<div data-c="${r.code}" data-e="${r.ex}"><span>${r.code} ${r.name}</span><small>${r.ex==='otc'?'上櫃':'上市'}</small></div>`).join('');
       sug.style.display=sugRes.length?'block':'none'}catch(e){}
   },180);
@@ -743,7 +748,7 @@ dlg.addEventListener('click',e=>{if(e.target===dlg)dlg.close()});
 
 /* ---------- 啟動 ---------- */
 applyTheme();renderToolbar();renderWatch();renderAlertBox();renderMkt();
-fetch('/api/info').then(r=>r.json()).then(j=>{st.demo=!!j.demo;if(st.demo)$('#demoTag').style.display='inline-block';else if(j.source==='sinopac'){const t=$('#demoTag');t.textContent='永豐 API';t.style.background='#22c55e';t.style.color='#fff';t.style.display='inline-block'}renderMkt()}).catch(()=>{});
+api('/api/info').then(j=>{st.demo=!!j.demo;if(st.demo)$('#demoTag').style.display='inline-block';else if(j.source==='sinopac'){const t=$('#demoTag');t.textContent='永豐 API';t.style.background='#22c55e';t.style.color='#fff';t.style.display='inline-block'}renderMkt()}).catch(()=>{});
 pollQuotes();loadHistory();
 setInterval(renderMkt,1000);
 window.addEventListener('resize',draw);

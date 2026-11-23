@@ -1,33 +1,1268 @@
-<!DOCTYPE html>
-<html lang="en">
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+台股即時看盤程式 (Taiwan Stock Monitor)
+- 只使用 Python 標準庫，不需安裝任何套件 (Python 3.8+)
+- 即時報價：證交所 MIS (mis.twse.com.tw)，上市/上櫃/指數/ETF
+- 歷史 K 線：Yahoo Finance (失敗時，日K 退回證交所 STOCK_DAY)
+- 執行：python3 tw_stock_monitor.py        然後瀏覽器會自動開啟
+        python3 tw_stock_monitor.py --demo  離線示範模式 (假資料)
+資料僅供參考，非投資建議。
+"""
+import argparse
+import calendar
+import datetime as dt
+import http.cookiejar
+import json
+import math
+import random
+import re
+import ssl
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+import webbrowser
+import zlib
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+CTX = ssl.create_default_context()
+DEMO = False
+KNOWN_EX = {}          # code -> 'tse' / 'otc'
+TAIPEI = dt.timezone(dt.timedelta(hours=8))
+
+
+def taipei_now():
+    return dt.datetime.now(TAIPEI)
+
+
+def ts_of(d):
+    """某日 09:00 (台北時間) 的 epoch 秒"""
+    return calendar.timegm((d.year, d.month, d.day, 1, 0, 0))
+
+
+def http_json(url, headers=None, timeout=12):
+    h = {"User-Agent": UA, "Accept": "application/json,text/plain,*/*"}
+    h.update(headers or {})
+    req = urllib.request.Request(url, headers=h)
+    with urllib.request.urlopen(req, timeout=timeout, context=CTX) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def fnum(x):
+    try:
+        v = float(str(x).replace(",", ""))
+        return None if math.isnan(v) else v
+    except Exception:
+        return None
+
+
+def tick_size(p):
+    if p < 10: return 0.01
+    if p < 50: return 0.05
+    if p < 100: return 0.1
+    if p < 500: return 0.5
+    if p < 1000: return 1.0
+    return 5.0
+
+
+def rtick(p):
+    t = tick_size(p)
+    return round(round(p / t) * t, 2)
+
+
+# ----------------------------------------------------------------- MIS 即時報價
+class MIS:
+    def __init__(self):
+        self.cj = http.cookiejar.CookieJar()
+        self.op = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.cj),
+            urllib.request.HTTPSHandler(context=CTX))
+        self.op.addheaders = [("User-Agent", UA), ("Accept-Language", "zh-TW,zh;q=0.9")]
+        self.t0 = 0
+        self.lock = threading.Lock()
+
+    def ensure(self, force=False):
+        if force or time.time() - self.t0 > 600:
+            self.op.open("https://mis.twse.com.tw/stock/index.jsp", timeout=10).read()
+            self.t0 = time.time()
+
+    def fetch(self, ex_chs):
+        with self.lock:
+            for attempt in (0, 1):
+                try:
+                    self.ensure(force=attempt == 1)
+                    url = ("https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=" +
+                           urllib.parse.quote("|".join(ex_chs), safe="|_.") +
+                           "&json=1&delay=0&_=" + str(int(time.time() * 1000)))
+                    req = urllib.request.Request(
+                        url, headers={"Referer": "https://mis.twse.com.tw/stock/index.jsp"})
+                    data = json.loads(self.op.open(req, timeout=10).read().decode("utf-8"))
+                    return data.get("msgArray", [])
+                except Exception:
+                    if attempt == 1:
+                        raise
+        return []
+
+
+_mis = None
+
+
+def lst(s):
+    return [fnum(v) for v in (s or "").split("_") if v != ""]
+
+
+def norm_quote(r):
+    ts = fnum(r.get("tlong"))
+    return {
+        "code": r.get("c"), "name": r.get("n"), "full": r.get("nf"),
+        "ex": r.get("ex", "tse"),
+        "price": fnum(r.get("z")), "prev": fnum(r.get("y")),
+        "open": fnum(r.get("o")), "high": fnum(r.get("h")), "low": fnum(r.get("l")),
+        "vol": fnum(r.get("v")), "tv": fnum(r.get("tv")),
+        "ask": lst(r.get("a")), "askVol": lst(r.get("f")),
+        "bid": lst(r.get("b")), "bidVol": lst(r.get("g")),
+        "up": fnum(r.get("u")), "down": fnum(r.get("w")),
+        "time": r.get("t"), "date": r.get("d"),
+        "ts": int(ts) if ts else None,
+    }
+
+
+def get_quotes(codes):
+    if DEMO:
+        return demo_quotes(codes)
+    global _mis
+    if _mis is None:
+        _mis = MIS()
+    chs = []
+    for c in codes:
+        if c == "t00": chs.append("tse_t00.tw"); continue
+        if c == "o00": chs.append("otc_o00.otc"); continue
+        ex = KNOWN_EX.get(c)
+        if ex in (None, "tse"): chs.append("tse_%s.tw" % c)
+        if ex in (None, "otc"): chs.append("otc_%s.otc" % c)
+    rows = []
+    for i in range(0, len(chs), 40):
+        rows += _mis.fetch(chs[i:i + 40])
+    out = {}
+    for r in rows:
+        if not r.get("c") or not r.get("n"):
+            continue
+        q = norm_quote(r)
+        if q["code"] not in ("t00", "o00"):
+            KNOWN_EX[q["code"]] = q["ex"]
+        old = out.get(q["code"])
+        if old is None or (old["price"] is None and q["price"] is not None):
+            out[q["code"]] = q
+    return out
+
+
+# ----------------------------------------------------------------- 歷史資料
+YF_MAP = {"rt": ("1d", "1m"), "5d": ("5d", "5m"), "5m": ("1mo", "5m"),
+          "15m": ("1mo", "15m"), "60m": ("6mo", "60m"),
+          "D": ("2y", "1d"), "W": ("5y", "1wk"), "M": ("max", "1mo")}
+_hcache = {}
+
+
+def yahoo_symbols(code, ex):
+    if code == "t00": return ["^TWII"]
+    if code == "o00": return ["^TWOII"]
+    if ex == "otc": return [code + ".TWO", code + ".TW"]
+    return [code + ".TW", code + ".TWO"]
+
+
+def yahoo_history(code, ex, tf):
+    rng, itv = YF_MAP[tf]
+    last_err = None
+    for sym in yahoo_symbols(code, ex):
+        url = ("https://query1.finance.yahoo.com/v8/finance/chart/%s?range=%s&interval=%s&includePrePost=false"
+               % (urllib.parse.quote(sym), rng, itv))
+        try:
+            j = http_json(url)
+            res = j["chart"]["result"][0]
+            ts = res.get("timestamp") or []
+            qd = res["indicators"]["quote"][0]
+            bars = []
+            for i, t in enumerate(ts):
+                o, h, l, c = qd["open"][i], qd["high"][i], qd["low"][i], qd["close"][i]
+                if None in (o, h, l, c):
+                    continue
+                v = qd["volume"][i] or 0
+                bars.append([int(t), round(o, 2), round(h, 2), round(l, 2), round(c, 2),
+                             round(v / 1000.0, 1) if code not in ("t00", "o00") else 0])
+            if not bars:
+                raise ValueError("no data")
+            meta = res.get("meta", {})
+            return {"bars": bars, "prevClose": meta.get("chartPreviousClose") or meta.get("previousClose"),
+                    "source": "Yahoo Finance"}
+        except Exception as e:
+            last_err = e
+    raise RuntimeError("Yahoo 無資料 (%s)" % last_err)
+
+
+def twse_daily(code, months=10):
+    today = taipei_now().date()
+    ym, y, m = [], today.year, today.month
+    for _ in range(months):
+        ym.append((y, m)); m -= 1
+        if m == 0: m, y = 12, y - 1
+
+    def one(p):
+        url = ("https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date=%d%02d01&stockNo=%s"
+               % (p[0], p[1], code))
+        rows = []
+        try:
+            d = http_json(url)
+        except Exception:
+            return rows
+        for r in d.get("data", []):
+            try:
+                ry, rm, rd = map(int, r[0].split("/"))
+                o, h, l, c = [float(x.replace(",", "")) for x in (r[3], r[4], r[5], r[6])]
+                rows.append([ts_of(dt.date(ry + 1911, rm, rd)), o, h, l, c,
+                             round(float(r[1].replace(",", "")) / 1000.0, 1)])
+            except Exception:
+                continue
+        return rows
+
+    with ThreadPoolExecutor(2) as ex:
+        res = list(ex.map(one, ym))
+    bars = sorted([b for part in res for b in part], key=lambda b: b[0])
+    if not bars:
+        raise RuntimeError("證交所也沒有資料 (僅支援上市)")
+    return bars
+
+
+def aggregate(bars, kind):
+    groups, order = {}, []
+    for b in bars:
+        d = dt.datetime.utcfromtimestamp(b[0]).date()
+        key = d.isocalendar()[:2] if kind == "W" else (d.year, d.month)
+        if key not in groups:
+            groups[key] = []; order.append(key)
+        groups[key].append(b)
+    out = []
+    for k in order:
+        g = groups[k]
+        out.append([g[0][0], g[0][1], max(x[2] for x in g), min(x[3] for x in g), g[-1][4],
+                    round(sum(x[5] for x in g), 1)])
+    return out
+
+
+def get_history(code, ex, tf):
+    if tf not in YF_MAP:
+        raise ValueError("bad tf")
+    key = (code, tf)
+    ttl = 15 if tf == "rt" else 120
+    hit = _hcache.get(key)
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1]
+    if DEMO:
+        res = demo_history(code, tf)
+    else:
+        try:
+            res = yahoo_history(code, ex, tf)
+        except Exception as e:
+            if tf in ("D", "W", "M") and code not in ("t00", "o00"):
+                bars = twse_daily(code)
+                if tf != "D":
+                    bars = aggregate(bars, tf)
+                res = {"bars": bars, "prevClose": None, "source": "TWSE (備援)"}
+            else:
+                raise
+    if tf == "rt":  # 只留最後一個交易日
+        last_day = (res["bars"][-1][0] + 28800) // 86400
+        res["bars"] = [b for b in res["bars"] if (b[0] + 28800) // 86400 == last_day]
+    _hcache[key] = (time.time(), res)
+    return res
+
+
+# ----------------------------------------------------------------- 股票名稱搜尋
+_names = {"t": 0, "data": []}
+_names_lock = threading.Lock()
+DEMO_NAMES = {
+    "2330": "台積電", "2317": "鴻海", "2454": "聯發科", "2603": "長榮", "2881": "富邦金",
+    "2882": "國泰金", "0050": "元大台灣50", "2412": "中華電", "2308": "台達電", "2303": "聯電",
+    "3008": "大立光", "2891": "中信金", "1301": "台塑", "2002": "中鋼", "6488": "環球晶",
+}
+DEMO_PRICE = {"2330": 1000, "2317": 200, "2454": 1300, "2603": 200, "2881": 90, "2882": 70,
+              "0050": 60, "2412": 120, "2308": 400, "2303": 50, "3008": 2200, "2891": 40,
+              "1301": 50, "2002": 20, "6488": 400, "t00": 22000, "o00": 250}
+
+
+def load_names():
+    with _names_lock:
+        if time.time() - _names["t"] < 12 * 3600:
+            return _names["data"]
+        data = []
+        if DEMO:
+            data = [(c, n, "otc" if c == "6488" else "tse") for c, n in DEMO_NAMES.items()]
+        else:
+            try:
+                for r in http_json("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"):
+                    data.append((r["Code"], r["Name"], "tse"))
+            except Exception:
+                pass
+            try:
+                for r in http_json("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"):
+                    data.append((r["SecuritiesCompanyCode"], r["CompanyName"], "otc"))
+            except Exception:
+                pass
+        for c, _, ex in data:
+            KNOWN_EX[c] = ex
+        _names["data"] = data
+        _names["t"] = time.time() if data else time.time() - 12 * 3600 + 60  # 失敗 60 秒後重試
+        return data
+
+
+def search(q):
+    q = q.strip().lower()
+    if not q:
+        return []
+    data = load_names()
+    exact, pre, sub = [], [], []
+    for c, n, ex in data:
+        if c.lower() == q: exact.append((c, n, ex))
+        elif c.lower().startswith(q): pre.append((c, n, ex))
+        elif q in n.lower(): sub.append((c, n, ex))
+    return [{"code": c, "name": n, "ex": ex} for c, n, ex in (exact + pre + sub)[:10]]
+
+
+# ----------------------------------------------------------------- 示範模式 (假資料)
+_demo = {}
+_demo_lock = threading.Lock()
+
+
+def demo_seed(code):
+    return zlib.crc32(code.encode())
+
+
+def demo_state(code):
+    s = _demo.get(code)
+    if s is None:
+        rnd = random.Random(demo_seed(code))
+        base = DEMO_PRICE.get(code) or (20 + demo_seed(code) % 600)
+        prev = rtick(base * (1 + rnd.uniform(-0.03, 0.03))) if code not in ("t00", "o00") else base
+        price = prev * (1 + rnd.uniform(-0.02, 0.02))
+        price = rtick(price) if code not in ("t00", "o00") else round(price, 2)
+        s = {"prev": prev, "price": price, "open": price, "high": price, "low": price,
+             "vol": rnd.randint(3000, 40000)}
+        _demo[code] = s
+    return s
+
+
+def demo_quotes(codes):
+    out = {}
+    now = taipei_now()
+    with _demo_lock:
+        for c in codes:
+            s = demo_state(c)
+            idx = c in ("t00", "o00")
+            step = (s["prev"] * 0.0006) if idx else tick_size(s["price"])
+            s["price"] += random.choice([-2, -1, -1, 0, 1, 1, 2]) * step
+            s["price"] = round(s["price"], 2) if idx else rtick(max(s["price"], 1))
+            s["high"] = max(s["high"], s["price"]); s["low"] = min(s["low"], s["price"])
+            tv = random.randint(1, 120)
+            s["vol"] += tv
+            p, t = s["price"], tick_size(s["price"])
+            out[c] = {
+                "code": c, "name": {"t00": "發行量加權股價指數", "o00": "櫃買指數"}.get(c, DEMO_NAMES.get(c, "示範" + c)),
+                "full": None, "ex": "otc" if c in ("6488", "o00") else "tse",
+                "price": p, "prev": s["prev"], "open": s["open"], "high": s["high"], "low": s["low"],
+                "vol": s["vol"], "tv": tv,
+                "ask": [] if idx else [round(p + t * (i + 1), 2) for i in range(5)],
+                "askVol": [] if idx else [random.randint(5, 900) for _ in range(5)],
+                "bid": [] if idx else [round(p - t * i, 2) for i in range(5)],
+                "bidVol": [] if idx else [random.randint(5, 900) for _ in range(5)],
+                "up": None if idx else rtick(s["prev"] * 1.1), "down": None if idx else rtick(s["prev"] * 0.9),
+                "time": now.strftime("%H:%M:%S"), "date": now.strftime("%Y%m%d"),
+                "ts": int(time.time() * 1000),
+            }
+    return out
+
+
+def demo_history(code, tf):
+    s = demo_state(code)
+    rnd = random.Random(demo_seed(code) * 131 + zlib.crc32(tf.encode()))
+    idx = code in ("t00", "o00")
+    now = taipei_now()
+    today = now.date()
+    spec = {"rt": (60, 270), "5d": (300, 54 * 5), "5m": (300, 54 * 20),
+            "15m": (900, 18 * 20), "60m": (3600, 5 * 20 * 3), "D": (86400, 500),
+            "W": (604800, 260), "M": (2592000, 120)}[tf]
+    step, n = spec
+    ts = []
+    if tf in ("D", "W", "M"):
+        d = today
+        for _ in range(n):
+            ts.append(ts_of(d))
+            d -= dt.timedelta(days=1 if tf == "D" else 7 if tf == "W" else 30)
+            while tf == "D" and d.weekday() >= 5:
+                d -= dt.timedelta(days=1)
+        ts.reverse()
+    else:
+        per_day = 270 if tf == "rt" else {"5d": 54, "5m": 54, "15m": 18, "60m": 4}[tf]
+        days = 1 if tf == "rt" else {"5d": 5, "5m": 20, "15m": 20, "60m": 60}[tf]
+        d, dl = today, []
+        while len(dl) < days:
+            if d.weekday() < 5: dl.append(d)
+            d -= dt.timedelta(days=1)
+        dl.reverse()
+        for dd in dl:
+            base = ts_of(dd)  # 09:00 台北
+            for k in range(per_day):
+                ts.append(base + k * step)
+        if tf == "rt":  # 盤中只到現在
+            nowts = int(time.time())
+            if dl[-1] == today and now.hour * 60 + now.minute < 810:
+                ts = [t for t in ts if t <= nowts]
+    n = len(ts)
+    p1 = s["price"]
+    p0 = p1 * (1 + rnd.uniform(-0.2, 0.2)) if tf in ("D", "W", "M") else (s["open"] if tf == "rt" else p1 * (1 + rnd.uniform(-0.05, 0.05)))
+    vol = 0.012 if tf in ("D", "W", "M") else 0.0015
+    w, acc = [], 0
+    for _ in range(n):
+        acc += rnd.gauss(0, 1); w.append(acc)
+    closes = []
+    for i in range(n):
+        frac = i / max(n - 1, 1)
+        val = p0 + (p1 - p0) * frac + (w[i] - frac * w[-1]) * vol * p1 / 3
+        closes.append(max(val, 1))
+    closes[-1] = p1
+    bars, prev = [], closes[0]
+    for i in range(n):
+        c = closes[i]; o = prev if i else p0
+        h = max(o, c) * (1 + abs(rnd.gauss(0, vol / 2)))
+        l = min(o, c) * (1 - abs(rnd.gauss(0, vol / 2)))
+        r2 = (lambda x: round(x, 2)) if idx else rtick
+        bars.append([ts[i], r2(o), r2(h), r2(l), r2(c), 0 if idx else rnd.randint(50, 3000)])
+        prev = c
+    return {"bars": bars, "prevClose": s["prev"], "source": "示範資料"}
+
+
+# ----------------------------------------------------------------- HTTP 伺服器
+HTML = r'''<!doctype html>
+<html lang="zh-Hant" data-theme="dark">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>益智遊戲2048</title>
-    <link rel="stylesheet" href="style.css">
-    <link rel="icon" type="image/png" href="img/picture.png">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>台股即時看盤</title>
+<style>
+:root{--bg:#0e1116;--panel:#161b22;--panel2:#1c222b;--line:#2a313c;--text:#d6dde8;--muted:#8793a4;--up:#ef4444;--dn:#22c55e;--fl:#d6dde8;--accent:#4f9cf9}
+[data-theme=light]{--bg:#eef1f5;--panel:#ffffff;--panel2:#f2f4f8;--line:#dde2ea;--text:#1d2530;--muted:#6b7585;--fl:#1d2530;--accent:#2563eb}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--text);font:13px/1.45 -apple-system,"Segoe UI","Noto Sans TC","PingFang TC","Microsoft JhengHei",sans-serif;display:flex;flex-direction:column;overflow:hidden}
+.num,.nm{font-variant-numeric:tabular-nums}
+.up{color:var(--up)}.dn{color:var(--dn)}.fl{color:var(--fl)}
+button,select,input{font:inherit;color:inherit}
+button{background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:4px 10px;cursor:pointer}
+button:hover{border-color:var(--accent)}
+button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+input,select{background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:4px 8px;outline:none}
+input:focus,select:focus{border-color:var(--accent)}
+header{display:flex;align-items:center;gap:14px;padding:8px 14px;background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap}
+.brand{font-weight:700;font-size:15px;white-space:nowrap}
+.brand small{background:#f59e0b;color:#000;border-radius:4px;padding:1px 6px;margin-left:6px;font-size:11px}
+.idx{display:flex;gap:16px}
+.ix{cursor:pointer;display:flex;gap:8px;align-items:baseline;padding:2px 8px;border-radius:6px}
+.ix:hover{background:var(--panel2)}
+.ix b{font-weight:600;color:var(--muted)}
+.sp{flex:1}
+.mkt{color:var(--muted);white-space:nowrap}
+.mkt i{font-style:normal;display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;background:var(--muted)}
+.mkt i.o{background:var(--dn)}.mkt i.e{background:var(--up)}
+main{flex:1;display:grid;grid-template-columns:minmax(340px,440px) 1fr;gap:10px;padding:10px;min-height:0}
+aside,.right{background:var(--panel);border:1px solid var(--line);border-radius:10px;min-height:0;min-width:0;display:flex;flex-direction:column}
+.add{position:relative;padding:10px;border-bottom:1px solid var(--line)}
+.add input{width:100%}
+.sug{position:absolute;left:10px;right:10px;top:44px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;z-index:5;box-shadow:0 8px 24px #0006;overflow:hidden}
+.sug div{padding:6px 10px;cursor:pointer;display:flex;justify-content:space-between}
+.sug div:hover{background:var(--accent);color:#fff}
+.sug small{color:var(--muted)}.sug div:hover small{color:#fff}
+.wlwrap{flex:1;overflow:auto}
+table{border-collapse:collapse;width:100%}
+th{position:sticky;top:0;background:var(--panel);color:var(--muted);font-weight:500;text-align:right;padding:6px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+th:first-child,td:first-child{text-align:left}
+td{padding:7px 8px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap}
+tr.r{cursor:pointer}
+tr.r:hover{background:var(--panel2)}
+tr.r.sel{background:var(--panel2);box-shadow:inset 3px 0 0 var(--accent)}
+td .c{color:var(--muted);font-size:11px;margin-left:6px}
+td.x{width:24px;padding:0 4px;text-align:center}
+td.x span{opacity:0;cursor:pointer;color:var(--muted)}
+tr.r:hover td.x span{opacity:1}
+td.x span:hover{color:var(--up)}
+@keyframes fu{from{background:#ef444455}to{background:transparent}}
+@keyframes fd{from{background:#22c55e55}to{background:transparent}}
+.flu{animation:fu .9s}.fld{animation:fd .9s}
+.lim{font-size:10px;border-radius:3px;padding:0 4px;margin-left:4px;color:#fff}
+.lim.u{background:var(--up)}.lim.d{background:var(--dn)}
+#head{display:flex;gap:18px;align-items:flex-end;flex-wrap:wrap;padding:10px 14px 4px}
+.hn b{font-size:18px}.hn span{color:var(--muted);margin-left:8px}
+.hn em{font-style:normal;font-size:11px;background:var(--panel2);border:1px solid var(--line);border-radius:4px;padding:0 5px;margin-left:6px;color:var(--muted)}
+.hp{font-size:30px;font-weight:700;line-height:1}
+.hc{font-size:15px;padding-bottom:2px}
+.stats{display:flex;gap:16px;flex-wrap:wrap;color:var(--muted);margin-left:auto}
+.stats div{display:flex;flex-direction:column;align-items:flex-end}
+.stats b{color:var(--text);font-weight:500}
+#alertBox{display:flex;gap:6px;align-items:center;padding:0 14px 6px;color:var(--muted);flex-wrap:wrap}
+#alertBox input{width:84px}
+#alertBox .tag{background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:0 8px;cursor:pointer}
+.toolbar{display:flex;gap:6px;padding:6px 14px;flex-wrap:wrap;align-items:center;border-top:1px solid var(--line)}
+.toolbar .g{display:flex;gap:4px;margin-right:8px}
+.toolbar .g.chips button{padding:2px 8px;font-size:12px}
+.cw{flex:1;display:grid;grid-template-columns:1fr 220px;min-height:320px;border-top:1px solid var(--line)}
+.cv{position:relative;min-width:0;min-height:0}
+#cv{position:absolute;inset:0;cursor:crosshair}
+#msg{position:absolute;inset:0;display:none;align-items:center;justify-content:center;color:var(--muted);pointer-events:none;text-align:center;padding:20px}
+#side{border-left:1px solid var(--line);overflow:auto;font-size:12px}
+.sh{padding:6px 10px;color:var(--muted);border-bottom:1px solid var(--line);background:var(--panel2)}
+.dr{position:relative;display:grid;grid-template-columns:34px 1fr 52px;padding:2px 10px;overflow:hidden}
+.dr i{position:absolute;right:0;top:1px;bottom:1px;opacity:.18;background:currentColor}
+.dr span{position:relative}
+.dr .dl{color:var(--muted)}.dr .dp{text-align:right;padding-right:8px}.dr .dv{text-align:right}
+.tk{display:grid;grid-template-columns:62px 1fr 48px;padding:1px 10px}
+.tk span:nth-child(2),.tk span:nth-child(3){text-align:right}
+#toast{position:fixed;right:16px;bottom:16px;display:flex;flex-direction:column;gap:8px;z-index:20}
+#toast div{background:var(--panel);border:1px solid var(--accent);border-radius:8px;padding:10px 14px;box-shadow:0 8px 24px #0006}
+dialog{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:12px;padding:0;width:min(760px,94vw);max-height:88vh}
+dialog::backdrop{background:#0009}
+.dh{display:flex;justify-content:space-between;align-items:center;padding:12px 18px;border-bottom:1px solid var(--line);font-weight:700;position:sticky;top:0;background:var(--panel);z-index:2}
+.db{padding:6px 18px 18px;overflow:auto;max-height:calc(88vh - 56px)}
+.db h4{margin:16px 0 8px;color:var(--accent);font-size:13px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:8px 18px}
+.f{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.f input[type=number]{width:70px}
+.f input[type=color]{width:34px;height:24px;padding:0;border:none;background:none}
+.f label.k{display:flex;align-items:center;gap:6px;cursor:pointer}
+.row{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.row .n{width:60px;color:var(--muted)}
+.row input[type=number]{width:70px}
+@media(max-width:1000px){main{grid-template-columns:1fr;overflow:auto}aside{max-height:300px}.cw{grid-template-columns:1fr}#side{display:none}body{overflow:auto}}
+</style>
 </head>
 <body>
-    <a href="https://2048game.com/?ref=google-search-classic&gad_source=1&gclid=CjwKCAiA0PuuBhBsEiwAS7fsNSOEFyU88y0jV0W49xkgC6Mtc9fIl-gRTLNJ7PDabJpb9Cg6E4iAkhoCTocQAvD_BwE" target="_blank">
-        <h1>2048 </h1>
-    </a>
-    <p>遊戲預覽</p>
-    <p><img src="img/2048.jpg" width="500"></p>
-    <audio id="PLAY">
-        <source src="img/Rick_Astley_-_Never_Gonna_Give_You_Up_.mp3">
-    </audio>
-        <button onclick="playAudio()" type="button" style="font-size: 60px; background-color: lightgoldenrodyellow; color: black; border-radius: 15px; width: 400px;">
-            點擊下載!!!
-        </button>
-    <script>
-        function playAudio() { 
-            var x = document.getElementById("PLAY"); 
-            x.play(); 
-        } 
-    </script>
-</a>
-        
-    
-    
+<header>
+  <div class="brand">📈 台股即時看盤<small id="demoTag" style="display:none">示範資料</small></div>
+  <div class="idx" id="idx"></div>
+  <div class="sp"></div>
+  <div class="mkt" id="mkt"></div>
+  <label>更新 <select id="refSel"><option value="2">2 秒</option><option value="3">3 秒</option><option value="5">5 秒</option><option value="10">10 秒</option><option value="20">20 秒</option><option value="30">30 秒</option><option value="60">60 秒</option></select></label>
+  <button id="btnTheme" title="切換亮/暗色">◐</button>
+  <button id="btnSet">⚙ 設定</button>
+</header>
+<main>
+  <aside>
+    <div class="add"><input id="addIn" placeholder="新增自選股：輸入代號或名稱 (如 2330、台積電)" autocomplete="off"><div id="sug" class="sug" style="display:none"></div></div>
+    <div class="wlwrap"><table id="wl"></table></div>
+  </aside>
+  <section class="right">
+    <div id="head"></div>
+    <div id="alertBox"></div>
+    <div class="toolbar" id="tb"></div>
+    <div class="cw">
+      <div class="cv"><canvas id="cv"></canvas><div id="msg"></div></div>
+      <div id="side"></div>
+    </div>
+  </section>
+</main>
+<dialog id="dlg"><div class="dh"><span>⚙ 看盤與圖表設定（即時儲存）</span><span><button id="btnReset">還原預設</button> <button id="btnClose">關閉</button></span></div><div class="db" id="dlgBody"></div></dialog>
+<div id="toast"></div>
+
+<script>
+(()=>{
+'use strict';
+const $=(s,e=document)=>e.querySelector(s);
+const KEY='twmon.v2';
+const DEF={
+  refresh:5, theme:'dark', scheme:'tw',
+  cols:{open:false,high:false,low:false,prev:false,vol:true,bid:false,ask:false},
+  chartType:'candle', rtType:'area', lineWidth:1.5, lineColor:'#4f9cf9', bodyRatio:0.7, barsDefault:120,
+  grid:true, crosshair:true, lastLine:true, hiLo:true, logScale:false, infoBar:true, prevLine:true,
+  ma:[{on:true,p:5,color:'#f5a623'},{on:true,p:10,color:'#4fc3f7'},{on:true,p:20,color:'#ba68c8'},{on:true,p:60,color:'#81c784'}],
+  ema:[{on:false,p:12,color:'#ff8a65'},{on:false,p:26,color:'#90a4ae'}],
+  boll:{on:false,p:20,k:2,color:'#ffd54f'},
+  volume:true,
+  macd:{on:false,f:12,s:26,g:9}, kd:{on:false,n:9}, rsi:{on:false,p:14}
+};
+const TFS=[['rt','分時'],['5d','五日'],['5m','5分'],['15m','15分'],['60m','60分'],['D','日K'],['W','週K'],['M','月K']];
+const CTYPES=[['candle','實心K線'],['hollow','空心K線'],['ohlc','美國線'],['line','線圖'],['area','面積圖']];
+const IDXN={t00:'加權指數',o00:'櫃買指數'};
+
+function merge(d,s){
+  if(Array.isArray(d))return d.map((x,i)=>merge(x,Array.isArray(s)?s[i]:undefined));
+  if(d&&typeof d==='object'){const o={};for(const k in d)o[k]=merge(d[k],s&&typeof s==='object'?s[k]:undefined);return o}
+  return (s===undefined||s===null)?d:s;
+}
+let saved={};try{saved=JSON.parse(localStorage.getItem(KEY))||{}}catch(e){}
+const S=merge(DEF,saved.S);
+const st={
+  watch:saved.watch||[{code:'2330'},{code:'2317'},{code:'2454'},{code:'2603'},{code:'2881'},{code:'0050'}],
+  sel:saved.sel||'2330', tf:saved.tf||'rt', alerts:saved.alerts||{},
+  q:{}, last:{}, bars:[], ind:null, prevClose:null, ticks:{}, view:{n:120,end:null}, hover:null, demo:false, L:null
+};
+function save(){try{localStorage.setItem(KEY,JSON.stringify({S,watch:st.watch,sel:st.sel,tf:st.tf,alerts:st.alerts}))}catch(e){}}
+
+/* ---------- 格式 ---------- */
+const pad=n=>String(n).padStart(2,'0');
+const tpD=t=>new Date(t*1000+288e5);
+const fmtDate=t=>{const d=tpD(t);return d.getUTCFullYear()+'/'+pad(d.getUTCMonth()+1)+'/'+pad(d.getUTCDate())};
+const fmtMD=t=>{const d=tpD(t);return pad(d.getUTCMonth()+1)+'/'+pad(d.getUTCDate())};
+const fmtHM=t=>{const d=tpD(t);return pad(d.getUTCHours())+':'+pad(d.getUTCMinutes())};
+const isIntra=tf=>tf==='rt'||tf==='5d'||tf==='5m'||tf==='15m'||tf==='60m';
+const fmtP=v=>v==null||isNaN(v)?'--':v.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+const fmtA=v=>v>=10000?v.toFixed(0):v>=1000?v.toFixed(1):v.toFixed(2);
+const fmtV=v=>v==null||isNaN(v)?'--':Math.round(v).toLocaleString('en-US');
+const fmtVs=v=>v>=1e6?(v/1e6).toFixed(1)+'M':v>=1e3?(v/1e3).toFixed(1)+'K':String(Math.round(v));
+const dcls=d=>d>0?'up':d<0?'dn':'fl';
+const nameOf=c=>IDXN[c]||(st.q[c]&&st.q[c].name)||c;
+function mkt(){const d=new Date(Date.now()+288e5);const day=d.getUTCDay(),m=d.getUTCHours()*60+d.getUTCMinutes();const wk=day>0&&day<6;return{open:wk&&m>=540&&m<=810,wk,m,d}}
+function px(q){ // 顯示用價格
+  if(!q)return null;
+  if(q.price!=null)return q.price;
+  return (q.bid&&q.bid[0])||(q.ask&&q.ask[0])||q.prev;
+}
+
+/* ---------- 主題 ---------- */
+function applyTheme(){
+  const r=document.documentElement;r.dataset.theme=S.theme;
+  const red='#ef4444',grn='#22c55e';
+  r.style.setProperty('--up',S.scheme==='tw'?red:grn);
+  r.style.setProperty('--dn',S.scheme==='tw'?grn:red);
+}
+
+/* ---------- 報價輪詢 ---------- */
+let timer=null,status='';
+async function pollQuotes(){
+  clearTimeout(timer);
+  const codes=[...new Set([...st.watch.map(w=>w.code),'t00','o00',st.sel])];
+  try{
+    const r=await fetch('/api/quote?codes='+codes.join(','));
+    const j=await r.json();
+    if(j.error)throw new Error(j.error);
+    applyQuotes(j.quotes);
+    status='ok';
+  }catch(e){status='err:'+e.message}
+  renderMkt();
+  const m=mkt();
+  const iv=(!m.open&&!st.demo)?Math.max(S.refresh,15):S.refresh;
+  timer=setTimeout(pollQuotes,iv*1000);
+}
+function applyQuotes(qs){
+  for(const c in qs){
+    const q=qs[c],old=st.q[c];
+    st.last[c]=old?px(old):null;
+    const w=st.watch.find(x=>x.code===c);if(w&&q.ex)w.ex=q.ex;
+    if(old&&q.vol!==old.vol&&q.tv&&q.price!=null){
+      const a=st.ticks[c]||(st.ticks[c]=[]);
+      a.unshift({t:q.time,p:q.price,v:q.tv});if(a.length>40)a.pop();
+    }
+    st.q[c]=q;
+    if(c===st.sel)liveBar(q,old&&old.vol!=null&&q.vol!=null?Math.max(0,q.vol-old.vol):0);
+  }
+  checkAlerts();
+  renderWatch();renderIdx();renderHead();renderSide();draw();
+}
+
+/* ---------- 即時併入 K 棒 ---------- */
+function bk(t,tf){
+  if(tf==='rt')return Math.floor(t/60);
+  if(tf==='5d'||tf==='5m')return Math.floor(t/300);
+  if(tf==='15m')return Math.floor(t/900);
+  if(tf==='60m')return Math.floor(t/3600);
+  const dn=Math.floor((t+28800)/86400);
+  if(tf==='D')return dn;
+  if(tf==='W')return Math.floor((dn+3)/7);
+  const d=tpD(t);return d.getUTCFullYear()*12+d.getUTCMonth();
+}
+function liveBar(q,dv){
+  if(!q||!st.bars.length&&st.tf!=='rt')return;
+  const p=q.price;if(p==null||!q.ts)return;
+  const t=Math.floor(q.ts/1000),tf=st.tf;
+  if(tf==='rt'&&st.bars.length&&bk(t,'D')!==bk(st.bars[st.bars.length-1].t,'D'))st.bars=[];
+  const intra=isIntra(tf);
+  let last=st.bars[st.bars.length-1];
+  if(!last||bk(t,tf)>bk(last.t,tf)){
+    const size={rt:60,'5d':300,'5m':300,'15m':900,'60m':3600}[tf];
+    st.bars.push({t:size?Math.floor(t/size)*size:t,o:p,h:p,l:p,c:p,v:tf==='D'?(q.vol||0):(intra?dv:0)});
+  }else if(bk(t,tf)===bk(last.t,tf)){
+    last.c=p;if(p>last.h)last.h=p;if(p<last.l)last.l=p;
+    if(tf==='D'){if(q.vol!=null)last.v=q.vol;if(q.high!=null)last.h=Math.max(last.h,q.high);if(q.low!=null)last.l=Math.min(last.l,q.low)}
+    else if(intra)last.v+=dv;
+  }else return;
+  recalc();
+}
+
+/* ---------- 歷史資料 ---------- */
+let histTok=0;
+async function loadHistory(){
+  const code=st.sel,tf=st.tf,tok=++histTok;
+  st.bars=[];st.ind=null;showMsg('載入中…');draw();
+  try{
+    const q=st.q[code],w=st.watch.find(x=>x.code===code);
+    const ex=(q&&q.ex)||(w&&w.ex)||'';
+    const r=await fetch(`/api/history?code=${code}&ex=${ex}&tf=${tf}`);
+    const j=await r.json();
+    if(tok!==histTok)return;
+    if(j.error)throw new Error(j.error);
+    st.bars=j.bars.map(b=>({t:b[0],o:b[1],h:b[2],l:b[3],c:b[4],v:b[5]}));
+    st.prevClose=j.prevClose;st.src=j.source;
+    resetView();
+    if(st.q[code])liveBar(st.q[code],0);
+    recalc();showMsg('');
+  }catch(e){if(tok===histTok)showMsg('歷史資料載入失敗：'+e.message+'\n(報價仍會即時更新，可稍後切換週期重試)')}
+  draw();
+}
+function resetView(){st.view.n=Math.max(15,Math.min(S.barsDefault,st.bars.length));st.view.end=null}
+function showMsg(t){const m=$('#msg');m.textContent=t;m.style.display=t?'flex':'none';m.style.whiteSpace='pre-line'}
+
+/* ---------- 指標 ---------- */
+function SMA(a,p){const r=new Array(a.length).fill(NaN);let s=0;for(let i=0;i<a.length;i++){s+=a[i];if(i>=p)s-=a[i-p];if(i>=p-1)r[i]=s/p}return r}
+function EMAr(a,p){const r=[],k=2/(p+1);let e=0;for(let i=0;i<a.length;i++){e=i?a[i]*k+e*(1-k):a[0];r.push(e)}return r}
+function EMA(a,p){return EMAr(a,p).map((v,i)=>i>=p-1?v:NaN)}
+function BOLL(a,p,k){const m=SMA(a,p),u=[],l=[];for(let i=0;i<a.length;i++){if(isNaN(m[i])){u.push(NaN);l.push(NaN);continue}let s=0;for(let j=i-p+1;j<=i;j++)s+=(a[j]-m[i])**2;const sd=Math.sqrt(s/p);u.push(m[i]+k*sd);l.push(m[i]-k*sd)}return{m,u,l}}
+function recalc(){
+  const b=st.bars;if(!b.length){st.ind=null;return}
+  const c=b.map(x=>x.c),I={};
+  I.ma=S.ma.map(x=>x.on?SMA(c,Math.max(1,x.p)):null);
+  I.ema=S.ema.map(x=>x.on?EMA(c,Math.max(1,x.p)):null);
+  I.boll=S.boll.on?BOLL(c,Math.max(2,S.boll.p),S.boll.k):null;
+  if(S.macd.on){const f=EMAr(c,S.macd.f),s=EMAr(c,S.macd.s),dif=f.map((v,i)=>v-s[i]),dea=EMAr(dif,S.macd.g);I.macd={dif,dea,osc:dif.map((v,i)=>v-dea[i])}}
+  if(S.kd.on){const n=Math.max(1,S.kd.n),K=[],D=[];let k=50,d=50;for(let i=0;i<b.length;i++){let hh=-Infinity,ll=Infinity;for(let j=Math.max(0,i-n+1);j<=i;j++){hh=Math.max(hh,b[j].h);ll=Math.min(ll,b[j].l)}const rsv=hh===ll?50:(b[i].c-ll)/(hh-ll)*100;k=2/3*k+rsv/3;d=2/3*d+k/3;K.push(k);D.push(d)}I.kd={k:K,d:D}}
+  if(S.rsi.on){const p=Math.max(1,S.rsi.p),r=new Array(c.length).fill(NaN);let ag=0,al=0;for(let i=1;i<c.length;i++){const ch=c[i]-c[i-1],g=Math.max(ch,0),l=Math.max(-ch,0);if(i<=p){ag+=g/p;al+=l/p}else{ag=(ag*(p-1)+g)/p;al=(al*(p-1)+l)/p}if(i>=p)r[i]=al===0?100:100-100/(1+ag/al)}I.rsi=r}
+  st.ind=I;
+}
+
+/* ---------- 繪圖 ---------- */
+function draw(){
+  const cv=$('#cv'),par=cv.parentElement,dpr=window.devicePixelRatio||1,W=par.clientWidth,H=par.clientHeight;
+  if(!W||!H)return;
+  if(cv.width!==Math.round(W*dpr)||cv.height!==Math.round(H*dpr)){cv.width=Math.round(W*dpr);cv.height=Math.round(H*dpr);cv.style.width=W+'px';cv.style.height=H+'px'}
+  const g=cv.getContext('2d');g.setTransform(dpr,0,0,dpr,0,0);g.clearRect(0,0,W,H);
+  const cs=getComputedStyle(document.documentElement),gv=n=>cs.getPropertyValue(n).trim();
+  const C={text:gv('--text'),muted:gv('--muted'),line:gv('--line'),up:gv('--up'),dn:gv('--dn'),fl:gv('--fl'),bg:gv('--panel'),acc:gv('--accent')};
+  const bars=st.bars,I=st.ind;st.L=null;
+  if(!bars.length){if($('#msg').style.display==='none'){g.fillStyle=C.muted;g.font='13px sans-serif';g.textAlign='center';g.fillText('尚無資料（盤前或尚未成交）',W/2,H/2)}return}
+  const tf=st.tf,rt=tf==='rt',n=bars.length;
+  const FONT='11px ui-monospace,Consolas,"Noto Sans TC",monospace';
+  g.font=FONT;
+  /* 時間軸槽位 */
+  let slotOf,s0,sN,i0,i1,ss=0;
+  if(rt){
+    ss=Math.floor((bars[n-1].t+28800)/86400)*86400-28800+9*3600;
+    slotOf=i=>Math.round((bars[i].t-ss)/60);s0=0;sN=271;i0=0;i1=n;
+  }else{
+    const v=st.view;v.n=Math.max(10,Math.min(v.n,n));
+    let end=v.end==null?n:Math.max(v.n,Math.min(v.end,n));
+    if(end>=n)v.end=null;else v.end=end;
+    i1=end;i0=end-v.n;slotOf=i=>i;s0=i0;sN=v.n;
+  }
+  const inRange=i=>{const s=slotOf(i);return s>=s0&&s<s0+sN};
+  /* 版面 */
+  const subs=[];if(S.volume)subs.push('vol');
+  if(!rt){if(S.macd.on)subs.push('macd');if(S.kd.on)subs.push('kd');if(S.rsi.on)subs.push('rsi')}
+  const padL=6,padR=64,padT=6,padB=20,gap=4,plotW=W-padL-padR,avail=H-padT-padB;
+  const subH=Math.floor(Math.min(110,Math.max(50,avail*0.17)));
+  let mainH=avail-subs.length*(subH+gap);
+  const sc=mainH<140&&subs.length?(avail-140)/(subs.length*(subH+gap)):1;
+  const sH=Math.floor(subH*Math.max(sc,.4));mainH=avail-subs.length*(sH+gap);
+  const bw=plotW/sN,xOf=s=>padL+(s-s0+0.5)*bw,R=Math.round;
+  const panels=[];let y=padT;
+  panels.push({id:'main',top:y,h:mainH});y+=mainH+gap;
+  subs.forEach(id=>{panels.push({id,top:y,h:sH});y+=sH+gap});
+  const base=rt?(st.q[st.sel]&&st.q[st.sel].prev)||st.prevClose||bars[0].o:null;
+  const lineMode=rt||S.chartType==='line'||S.chartType==='area';
+  const colOf=b=>b.c>b.o?C.up:b.c<b.o?C.dn:C.fl;
+  /* ---- 主圖 Y 範圍 ---- */
+  const P=panels[0];let lo=Infinity,hi=-Infinity;
+  for(let i=i0;i<i1;i++){if(!inRange(i))continue;const b=bars[i];hi=Math.max(hi,lineMode?b.c:b.h);lo=Math.min(lo,lineMode?b.c:b.l)}
+  const upd=a=>{if(!a)return;for(let i=i0;i<i1;i++){const v=a[i];if(!isNaN(v)){hi=Math.max(hi,v);lo=Math.min(lo,v)}}};
+  if(!rt&&I){I.ma.forEach(upd);I.ema.forEach(upd);if(I.boll){upd(I.boll.u);upd(I.boll.l)}}
+  if(!isFinite(lo)){lo=0;hi=1}
+  if(rt){const dev=Math.max(Math.abs(hi-base),Math.abs(lo-base),base*0.004)*1.08;hi=base+dev;lo=base-dev}
+  else{const pd=(hi-lo)*0.06||hi*0.01;hi+=pd;lo=Math.max(lo-pd,S.logScale?0.01:-Infinity)}
+  const LG=S.logScale&&!rt&&lo>0;
+  const T=v=>LG?Math.log(v):v,Ti=v=>LG?Math.exp(v):v;
+  const tl=T(lo),th=T(hi);
+  P.y=v=>P.top+(th-T(v))/(th-tl)*P.h;P.inv=yy=>Ti(th-(yy-P.top)/P.h*(th-tl));
+  /* ---- 格線 ---- */
+  g.lineWidth=1;g.strokeStyle=C.line;g.fillStyle=C.muted;g.textAlign='left';g.textBaseline='middle';
+  panels.forEach(p=>{g.strokeStyle=C.line;g.strokeRect(padL+.5,R(p.top)+.5,plotW,R(p.h))});
+  if(S.grid){
+    g.save();g.strokeStyle=C.line;g.globalAlpha=.55;g.setLineDash([2,4]);
+    for(let k=1;k<4;k++){const yy=R(P.top+P.h*k/4)+.5;g.beginPath();g.moveTo(padL,yy);g.lineTo(padL+plotW,yy);g.stroke()}
+    g.restore();
+  }
+  for(let k=0;k<=4;k++){const v=Ti(th-(th-tl)*k/4),yy=P.top+P.h*k/4;g.fillStyle=C.muted;g.fillText(fmtA(v),padL+plotW+5,Math.min(Math.max(yy,P.top+6),P.top+P.h-6))}
+  if(rt){ // 基準線與百分比
+    g.save();g.strokeStyle=C.muted;g.setLineDash([4,3]);const yb=R(P.y(base))+.5;g.beginPath();g.moveTo(padL,yb);g.lineTo(padL+plotW,yb);g.stroke();g.restore();
+    g.textAlign='left';for(let k=0;k<=4;k++){const v=Ti(th-(th-tl)*k/4),pc=(v/base-1)*100;g.fillStyle=pc>0.001?C.up:pc<-0.001?C.dn:C.muted;g.fillText((pc>0?'+':'')+pc.toFixed(2)+'%',padL+4,Math.min(Math.max(P.top+P.h*k/4,P.top+8),P.top+P.h-8))}
+  }
+  /* ---- 時間軸 ---- */
+  g.textAlign='center';g.textBaseline='top';g.fillStyle=C.muted;
+  const tlab=[];
+  if(rt){[[0,'09:00'],[60,'10:00'],[120,'11:00'],[180,'12:00'],[240,'13:00'],[270,'13:30']].forEach(([s,t])=>tlab.push([s,t]))}
+  else{
+    const step=Math.max(1,Math.floor(sN/6));
+    for(let i=i0+Math.floor(step/2);i<i1;i+=step){const t=bars[i].t;tlab.push([i,isIntra(tf)?fmtMD(t)+' '+fmtHM(t):(tf==='D'?fmtMD(t):fmtDate(t).slice(0,7))])}
+  }
+  tlab.forEach(([s,t])=>{const x=xOf(s);if(x<padL+14||x>padL+plotW-14)return;g.fillStyle=C.muted;g.fillText(t,x,H-padB+5);
+    if(S.grid){g.save();g.strokeStyle=C.line;g.globalAlpha=.45;g.setLineDash([2,4]);g.beginPath();g.moveTo(R(x)+.5,P.top);g.lineTo(R(x)+.5,panels[panels.length-1].top+panels[panels.length-1].h);g.stroke();g.restore()}});
+  /* ---- 主圖內容 ---- */
+  g.save();g.beginPath();g.rect(padL,P.top,plotW,P.h);g.clip();
+  if(!rt&&I&&I.boll){
+    const B=I.boll;g.beginPath();let st0=false;
+    for(let i=i0;i<i1;i++){if(isNaN(B.u[i]))continue;const x=xOf(i),yy=P.y(B.u[i]);if(!st0){g.moveTo(x,yy);st0=true}else g.lineTo(x,yy)}
+    for(let i=i1-1;i>=i0;i--){if(isNaN(B.l[i]))continue;g.lineTo(xOf(i),P.y(B.l[i]))}
+    g.fillStyle=S.boll.color+'18';g.fill();
+    [B.u,B.m,B.l].forEach((a,k)=>poly(g,a,i0,i1,xOf,P.y,S.boll.color,1,k===1?[4,3]:null));
+  }
+  if(lineMode){
+    const lc=rt?(bars[n-1].c>=base?C.up:C.dn):S.lineColor,area=rt?S.rtType==='area':S.chartType==='area';
+    const arr=bars.map(b=>b.c);
+    g.beginPath();let first=true,lastX=0,firstX=0;
+    for(let i=i0;i<i1;i++){if(!inRange(i))continue;const x=xOf(slotOf(i)),yy=P.y(arr[i]);if(first){g.moveTo(x,yy);firstX=x;first=false}else g.lineTo(x,yy);lastX=x}
+    if(area&&!first){
+      const gr=g.createLinearGradient(0,P.top,0,P.top+P.h);gr.addColorStop(0,lc+'55');gr.addColorStop(1,lc+'05');
+      g.save();g.lineTo(lastX,P.top+P.h);g.lineTo(firstX,P.top+P.h);g.closePath();g.fillStyle=gr;g.fill();g.restore();
+      g.beginPath();first=true;
+      for(let i=i0;i<i1;i++){if(!inRange(i))continue;const x=xOf(slotOf(i)),yy=P.y(arr[i]);if(first){g.moveTo(x,yy);first=false}else g.lineTo(x,yy)}
+    }
+    g.strokeStyle=lc;g.lineWidth=S.lineWidth;g.lineJoin='round';g.stroke();
+  }else{
+    const body=Math.max(1,Math.floor(bw*S.bodyRatio)),type=S.chartType;
+    for(let i=i0;i<i1;i++){
+      const b=bars[i],x=R(xOf(i))+(body%2?.5:0),col=colOf(b),yh=R(P.y(b.h)),yl=R(P.y(b.l)),yo=R(P.y(b.o)),yc=R(P.y(b.c));
+      g.strokeStyle=col;g.fillStyle=col;g.lineWidth=1;
+      if(type==='ohlc'){
+        g.lineWidth=bw>6?1.5:1;g.beginPath();g.moveTo(x,yh);g.lineTo(x,yl);const t=Math.max(2,body/2);g.moveTo(x-t,yo);g.lineTo(x,yo);g.moveTo(x,yc);g.lineTo(x+t,yc);g.stroke();
+      }else{
+        g.beginPath();g.moveTo(x,yh);g.lineTo(x,yl);g.stroke();
+        const top=Math.min(yo,yc),h=Math.max(1,Math.abs(yo-yc));
+        if(body>=2){
+          if(type==='hollow'&&b.c>b.o){g.fillStyle=C.bg;g.fillRect(x-body/2,top,body,h);g.strokeRect(x-body/2+.5,top+.5,body-1,Math.max(h-1,0))}
+          else g.fillRect(x-body/2,top,body,h);
+        }
+      }
+    }
+  }
+  if(!rt&&I){
+    I.ma.forEach((a,k)=>a&&poly(g,a,i0,i1,xOf,P.y,S.ma[k].color,1.2));
+    I.ema.forEach((a,k)=>a&&poly(g,a,i0,i1,xOf,P.y,S.ema[k].color,1.2,[5,3]));
+  }
+  g.restore();
+  /* 最高/最低標記 */
+  if(S.hiLo&&!rt){
+    let hI=-1,lI=-1;for(let i=i0;i<i1;i++){if(hI<0||bars[i].h>bars[hI].h)hI=i;if(lI<0||bars[i].l<bars[lI].l)lI=i}
+    g.font=FONT;g.textBaseline='middle';g.fillStyle=C.text;
+    const mk=(i,v,yy)=>{const x=xOf(i),right=x<padL+plotW/2;g.textAlign=right?'left':'right';g.fillText((right?'← ':'')+fmtA(v)+(right?'':' →'),x+(right?4:-4),yy)};
+    if(hI>=0)mk(hI,bars[hI].h,Math.max(P.y(bars[hI].h),P.top+8));
+    if(lI>=0)mk(lI,bars[lI].l,Math.min(P.y(bars[lI].l),P.top+P.h-8));
+  }
+  /* 現價線 */
+  const lb=bars[n-1],lastQ=st.q[st.sel],lastP=lb.c;
+  if(S.lastLine&&(rt||i1>=n)){
+    const ref=rt?base:(n>1?bars[n-2].c:lb.o),col=lastP>ref?C.up:lastP<ref?C.dn:C.fl,yy=R(P.y(lastP))+.5;
+    if(yy>P.top&&yy<P.top+P.h){
+      g.save();g.strokeStyle=col;g.setLineDash([3,3]);g.globalAlpha=.8;g.beginPath();g.moveTo(padL,yy);g.lineTo(padL+plotW,yy);g.stroke();g.restore();
+      tag(g,padL+plotW+1,yy,fmtA(lastP),col,'#fff',padR-2);
+    }
+  }
+  /* ---- 副圖 ---- */
+  const lastShown=rt?n-1:Math.min(i1-1,n-1);
+  const hv=st.hover&&st.hover.i!=null?st.hover.i:null,ref=hv!=null?hv:lastShown;
+  panels.slice(1).forEach(p=>{
+    g.save();g.beginPath();g.rect(padL,p.top,plotW,p.h);g.clip();
+    g.font=FONT;g.textAlign='left';g.textBaseline='top';
+    if(p.id==='vol'){
+      let mx=1;for(let i=i0;i<i1;i++)if(inRange(i))mx=Math.max(mx,bars[i].v);
+      p.y=v=>p.top+p.h-v/mx*(p.h-14);p.inv=yy=>(p.top+p.h-yy)/(p.h-14)*mx;
+      const body=Math.max(1,Math.floor(bw*S.bodyRatio));
+      for(let i=i0;i<i1;i++){if(!inRange(i))continue;const b=bars[i];g.fillStyle=colOf(b);const x=R(xOf(slotOf(i)));g.fillRect(x-body/2,R(p.y(b.v)),body,p.top+p.h-R(p.y(b.v)))}
+      g.fillStyle=C.muted;g.fillText('成交量(張) '+fmtV(bars[ref].v),padL+4,p.top+2);
+      g.restore();g.textAlign='left';g.textBaseline='middle';g.fillStyle=C.muted;g.fillText(fmtVs(mx),padL+plotW+5,p.top+12);
+    }else if(p.id==='macd'){
+      const M=I&&I.macd;let mx=1e-9;if(M)for(let i=i0;i<i1;i++)mx=Math.max(mx,Math.abs(M.dif[i]),Math.abs(M.dea[i]),Math.abs(M.osc[i]));
+      p.y=v=>p.top+p.h/2-v/mx*(p.h/2-8);p.inv=yy=>(p.top+p.h/2-yy)/(p.h/2-8)*mx;
+      if(M){const body=Math.max(1,Math.floor(bw*S.bodyRatio));
+        for(let i=i0;i<i1;i++){const v=M.osc[i];g.fillStyle=v>=0?C.up:C.dn;const x=R(xOf(i)),y0=R(p.y(0)),y1=R(p.y(v));g.fillRect(x-body/2,Math.min(y0,y1),body,Math.max(1,Math.abs(y1-y0)))}
+        poly(g,M.dif,i0,i1,xOf,p.y,'#f5a623',1.2);poly(g,M.dea,i0,i1,xOf,p.y,'#4fc3f7',1.2);
+        g.fillStyle=C.muted;g.fillText(`MACD(${S.macd.f},${S.macd.s},${S.macd.g})  DIF ${M.dif[ref].toFixed(2)}  DEA ${M.dea[ref].toFixed(2)}  OSC ${M.osc[ref].toFixed(2)}`,padL+4,p.top+2)}
+      g.restore();
+    }else if(p.id==='kd'){
+      p.y=v=>p.top+6+(100-v)/100*(p.h-12);p.inv=yy=>100-(yy-p.top-6)/(p.h-12)*100;
+      g.strokeStyle=C.line;g.setLineDash([3,3]);[20,80].forEach(v=>{g.beginPath();g.moveTo(padL,R(p.y(v))+.5);g.lineTo(padL+plotW,R(p.y(v))+.5);g.stroke()});g.setLineDash([]);
+      const K=I&&I.kd;if(K){poly(g,K.k,i0,i1,xOf,p.y,'#f5a623',1.2);poly(g,K.d,i0,i1,xOf,p.y,'#4fc3f7',1.2);
+        g.fillStyle=C.muted;g.fillText(`KD(${S.kd.n})  K ${K.k[ref].toFixed(1)}  D ${K.d[ref].toFixed(1)}`,padL+4,p.top+2)}
+      g.restore();
+    }else if(p.id==='rsi'){
+      p.y=v=>p.top+6+(100-v)/100*(p.h-12);p.inv=yy=>100-(yy-p.top-6)/(p.h-12)*100;
+      g.strokeStyle=C.line;g.setLineDash([3,3]);[30,70].forEach(v=>{g.beginPath();g.moveTo(padL,R(p.y(v))+.5);g.lineTo(padL+plotW,R(p.y(v))+.5);g.stroke()});g.setLineDash([]);
+      if(I&&I.rsi){poly(g,I.rsi,i0,i1,xOf,p.y,'#ba68c8',1.3);g.fillStyle=C.muted;const v=I.rsi[ref];g.fillText(`RSI(${S.rsi.p})  ${isNaN(v)?'--':v.toFixed(1)}`,padL+4,p.top+2)}
+      g.restore();
+    }
+    if(p.id!=='vol'){g.textAlign='left';g.textBaseline='middle';g.fillStyle=C.muted;
+      if(p.id==='macd'){g.fillText('0',padL+plotW+5,R(p.y(0)))}else{const a=p.id==='kd'?[80,20]:[70,30];a.forEach(v=>g.fillText(v,padL+plotW+5,R(p.y(v))))}}
+  });
+  /* ---- 資訊列 ---- */
+  g.font=FONT;g.textBaseline='top';g.textAlign='left';
+  if(S.infoBar){
+    const b=bars[ref],pv=ref>0?bars[ref-1].c:(rt?base:b.o),ch=b.c-pv,pc=pv?ch/pv*100:0;
+    const segs=[[isIntra(tf)?fmtDate(b.t)+' '+fmtHM(b.t):fmtDate(b.t),C.text],['開 '+fmtP(b.o),C.text],['高 '+fmtP(b.h),C.up],['低 '+fmtP(b.l),C.dn],['收 '+fmtP(b.c),C.text],
+      [(ch>=0?'+':'')+ch.toFixed(2)+' ('+(ch>=0?'+':'')+pc.toFixed(2)+'%)',ch>0?C.up:ch<0?C.dn:C.fl],['量 '+fmtV(b.v),C.muted]];
+    if(!rt&&I){S.ma.forEach((m,k)=>{const v=I.ma[k]&&I.ma[k][ref];if(m.on&&v!=null&&!isNaN(v))segs.push([`MA${m.p} ${fmtA(v)}`,m.color])});
+      S.ema.forEach((m,k)=>{const v=I.ema[k]&&I.ema[k][ref];if(m.on&&v!=null&&!isNaN(v))segs.push([`EMA${m.p} ${fmtA(v)}`,m.color])});
+      if(I.boll&&!isNaN(I.boll.m[ref]))segs.push([`BB ${fmtA(I.boll.u[ref])}/${fmtA(I.boll.m[ref])}/${fmtA(I.boll.l[ref])}`,S.boll.color])}
+    let x=padL+4,yy=P.top+3;g.fillStyle=C.bg+'cc';
+    const tw=segs.reduce((s,a)=>s+g.measureText(a[0]).width+12,0);
+    g.fillRect(padL+1,P.top+1,Math.min(plotW-2,tw+6),16);
+    for(const [t,c] of segs){const w=g.measureText(t).width;if(x+w>padL+plotW)break;g.fillStyle=c;g.fillText(t,x,yy);x+=w+12}
+  }
+  /* ---- 十字線 ---- */
+  st.L={padL,padR,plotW,s0,sN,i0,i1,bars:n,panels,slotOf,rt,xOf,bw};
+  const h=st.hover;
+  if(S.crosshair&&h&&h.x>=padL&&h.x<=padL+plotW){
+    g.save();g.strokeStyle=C.muted;g.setLineDash([3,3]);g.lineWidth=1;
+    const xx=h.i!=null?R(xOf(slotOf(h.i)))+.5:R(h.x)+.5;
+    g.beginPath();g.moveTo(xx,P.top);g.lineTo(xx,H-padB);g.stroke();
+    const pn=panels.find(p=>h.y>=p.top&&h.y<=p.top+p.h);
+    if(pn&&pn.inv){g.beginPath();g.moveTo(padL,R(h.y)+.5);g.lineTo(padL+plotW,R(h.y)+.5);g.stroke();
+      g.restore();const v=pn.inv(h.y);tag(g,padL+plotW+1,R(h.y),pn.id==='vol'?fmtVs(v):fmtA(v),C.acc,'#fff',padR-2);g.save()}
+    g.restore();
+    if(h.i!=null){const t=bars[h.i].t,lab=isIntra(tf)?fmtDate(t).slice(5)+' '+fmtHM(t):fmtDate(t);
+      g.font=FONT;const w=g.measureText(lab).width+12;let lx=Math.min(Math.max(xx-w/2,padL),padL+plotW-w);
+      g.fillStyle=C.acc;g.fillRect(lx,H-padB+1,w,16);g.fillStyle='#fff';g.textAlign='center';g.textBaseline='middle';g.fillText(lab,lx+w/2,H-padB+9)}
+  }
+}
+function poly(g,a,i0,i1,xOf,yOf,color,lw,dash){
+  g.save();g.strokeStyle=color;g.lineWidth=lw;if(dash)g.setLineDash(dash);g.lineJoin='round';g.beginPath();let on=false;
+  for(let i=i0;i<i1;i++){const v=a[i];if(v==null||isNaN(v)){on=false;continue}const x=xOf(i),y=yOf(v);if(!on){g.moveTo(x,y);on=true}else g.lineTo(x,y)}
+  g.stroke();g.restore();
+}
+function tag(g,x,y,text,bg,fg,w){
+  g.save();g.font='11px ui-monospace,Consolas,monospace';g.fillStyle=bg;g.fillRect(x,y-8,w,16);g.fillStyle=fg;g.textAlign='center';g.textBaseline='middle';g.fillText(text,x+w/2,y+.5);g.restore();
+}
+
+/* ---------- 圖表互動 ---------- */
+(()=>{
+  const cv=$('#cv');let drag=null,raf=0;
+  const redraw=()=>{if(raf)return;raf=requestAnimationFrame(()=>{raf=0;draw()})};
+  function idxAt(x){
+    const L=st.L;if(!L)return null;
+    const s=Math.floor((x-L.padL)/L.plotW*L.sN)+L.s0;
+    if(L.rt){let best=null;for(let i=0;i<st.bars.length;i++)if(L.slotOf(i)===s){best=i;break}return best}
+    return s>=L.i0&&s<L.i1?s:null;
+  }
+  cv.addEventListener('mousemove',e=>{
+    const r=cv.getBoundingClientRect(),x=e.clientX-r.left,y=e.clientY-r.top;
+    if(drag&&!(st.L&&st.L.rt)){
+      const L=st.L,per=L.plotW/st.view.n,d=Math.round((x-drag.x)/per);
+      st.view.end=Math.max(st.view.n,Math.min(st.bars.length,drag.end-d));
+    }
+    st.hover={x,y,i:idxAt(x)};redraw();
+  });
+  cv.addEventListener('mouseleave',()=>{st.hover=null;drag=null;redraw()});
+  cv.addEventListener('mousedown',e=>{const r=cv.getBoundingClientRect();drag={x:e.clientX-r.left,end:st.view.end==null?st.bars.length:st.view.end};cv.style.cursor='grabbing'});
+  window.addEventListener('mouseup',()=>{drag=null;cv.style.cursor='crosshair'});
+  cv.addEventListener('wheel',e=>{
+    e.preventDefault();const L=st.L;if(!L||L.rt)return;
+    const r=cv.getBoundingClientRect(),fx=Math.max(0,Math.min(1,(e.clientX-r.left-L.padL)/L.plotW));
+    const n0=st.view.n,len=st.bars.length,n1=Math.max(15,Math.min(len,Math.round(n0*(e.deltaY>0?1.15:0.87))));
+    if(n1===n0)return;
+    const end0=st.view.end==null?len:st.view.end,anchor=end0-n0+fx*n0,start1=anchor-fx*n1;
+    st.view.n=n1;st.view.end=Math.max(n1,Math.min(len,Math.round(start1+n1)));if(st.view.end>=len)st.view.end=null;
+    st.hover=null;redraw();
+  },{passive:false});
+  cv.addEventListener('dblclick',()=>{resetView();draw()});
+  new ResizeObserver(()=>draw()).observe(cv.parentElement);
+})();
+
+/* ---------- 畫面 ---------- */
+function renderMkt(){
+  const m=mkt(),el=$('#mkt'),d=m.d;
+  const clock=`${d.getUTCFullYear()}/${pad(d.getUTCMonth()+1)}/${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())} (台北)`;
+  let s=m.open?'<i class="o"></i>盤中':(m.wk?(m.m<540?'<i></i>盤前':'<i></i>已收盤'):'<i></i>休市');
+  if(st.demo)s='<i class="o"></i>示範';
+  const e=status.startsWith('err')?` <span class="up" title="${status.slice(4).replace(/"/g,'')}">⚠ 連線失敗</span>`:'';
+  el.innerHTML=s+' · '+clock+e;
+}
+function renderIdx(){
+  $('#idx').innerHTML=['t00','o00'].map(c=>{
+    const q=st.q[c];if(!q)return `<div class="ix"><b>${IDXN[c]}</b>…</div>`;
+    const p=px(q),ch=p-q.prev,pc=ch/q.prev*100,k=dcls(ch);
+    return `<div class="ix" data-c="${c}"><b>${c==='t00'?'加權':'櫃買'}</b><span class="num ${k}">${fmtP(p)}</span><span class="num ${k}">${ch>0?'▲':ch<0?'▼':''}${Math.abs(ch).toFixed(2)} (${pc.toFixed(2)}%)</span></div>`;
+  }).join('');
+}
+function renderWatch(){
+  const C=S.cols;
+  let h='<tr><th>名稱 / 代號</th><th>成交</th><th>漲跌</th><th>幅度</th>'+
+    (C.open?'<th>開</th>':'')+(C.high?'<th>高</th>':'')+(C.low?'<th>低</th>':'')+(C.prev?'<th>昨收</th>':'')+(C.bid?'<th>買進</th>':'')+(C.ask?'<th>賣出</th>':'')+(C.vol?'<th>量(張)</th>':'')+'<th></th></tr>';
+  for(const w of st.watch){
+    const q=st.q[w.code];
+    if(!q){h+=`<tr class="r${w.code===st.sel?' sel':''}" data-c="${w.code}"><td>${w.code}</td><td colspan="9" style="color:var(--muted);text-align:left">讀取中…(若持續無資料請確認代號)</td><td class="x"><span data-x="${w.code}">✕</span></td></tr>`;continue}
+    const p=px(q),ch=p-q.prev,pc=q.prev?ch/q.prev*100:0,k=dcls(ch),lp=st.last[w.code];
+    const fl=lp!=null&&p!==lp?(p>lp?'flu':'fld'):'';
+    const lim=q.up&&p>=q.up?'<span class="lim u">漲停</span>':q.down&&p<=q.down?'<span class="lim d">跌停</span>':'';
+    h+=`<tr class="r${w.code===st.sel?' sel':''}" data-c="${w.code}"><td>${q.name}<span class="c">${w.code}</span>${lim}</td>`+
+      `<td class="num ${k} ${fl}"><b>${fmtP(p)}</b></td><td class="num ${k}">${ch>0?'▲':ch<0?'▼':''}${Math.abs(ch).toFixed(2)}</td><td class="num ${k}">${pc>0?'+':''}${pc.toFixed(2)}%</td>`+
+      (C.open?`<td class="num ${dcls(q.open-q.prev)}">${fmtP(q.open)}</td>`:'')+(C.high?`<td class="num ${dcls(q.high-q.prev)}">${fmtP(q.high)}</td>`:'')+(C.low?`<td class="num ${dcls(q.low-q.prev)}">${fmtP(q.low)}</td>`:'')+(C.prev?`<td class="num">${fmtP(q.prev)}</td>`:'')+
+      (C.bid?`<td class="num">${fmtP(q.bid&&q.bid[0])}</td>`:'')+(C.ask?`<td class="num">${fmtP(q.ask&&q.ask[0])}</td>`:'')+(C.vol?`<td class="num">${fmtV(q.vol)}</td>`:'')+
+      `<td class="x"><span data-x="${w.code}" title="移除">✕</span></td></tr>`;
+  }
+  $('#wl').innerHTML=h;
+}
+function renderHead(){
+  const q=st.q[st.sel];
+  if(!q){$('#head').innerHTML='<div class="hn"><b>'+st.sel+'</b> 讀取中…</div>';return}
+  const p=px(q),ch=p-q.prev,pc=q.prev?ch/q.prev*100:0,k=dcls(ch),idx=!!IDXN[q.code];
+  const t=q.time?q.time:'--';
+  $('#head').innerHTML=`<div class="hn"><b>${idx?IDXN[q.code]:q.name}</b><span>${q.code}</span>${idx?'':`<em>${q.ex==='otc'?'上櫃':'上市'}</em>`}</div>
+   <div class="hp num ${k}">${fmtP(p)}</div><div class="hc num ${k}">${ch>0?'▲':ch<0?'▼':''} ${Math.abs(ch).toFixed(2)} (${pc>0?'+':''}${pc.toFixed(2)}%)</div>
+   <div class="stats num"><div>開<b class="${dcls(q.open-q.prev)}">${fmtP(q.open)}</b></div><div>高<b class="up">${fmtP(q.high)}</b></div><div>低<b class="dn">${fmtP(q.low)}</b></div><div>昨收<b>${fmtP(q.prev)}</b></div>${idx?'':`<div>量(張)<b>${fmtV(q.vol)}</b></div><div>漲停<b>${fmtP(q.up)}</b></div><div>跌停<b>${fmtP(q.down)}</b></div>`}<div>時間<b>${t}</b></div></div>`;
+}
+function renderSide(){
+  const q=st.q[st.sel];const el=$('#side');
+  if(!q){el.innerHTML='';return}
+  let h='';
+  if(q.bid&&q.bid.length||q.ask&&q.ask.length){
+    const mx=Math.max(1,...(q.askVol||[]),...(q.bidVol||[]));
+    const row=(lab,p,v,cl)=>`<div class="dr ${cl}"><span class="dl">${lab}</span><span class="dp num ${dcls(p-q.prev)}">${fmtP(p)}</span><span class="dv num">${fmtV(v)}</span><i style="width:${(v||0)/mx*100}%"></i></div>`;
+    h+='<div class="sh">最佳五檔</div>';
+    for(let i=Math.min(4,(q.ask||[]).length-1);i>=0;i--)h+=row('賣'+(i+1),q.ask[i],q.askVol[i],'dn');
+    h+='<div style="height:1px;background:var(--line);margin:3px 0"></div>';
+    for(let i=0;i<Math.min(5,(q.bid||[]).length);i++)h+=row('買'+(i+1),q.bid[i],q.bidVol[i],'up');
+  }
+  const tk=st.ticks[st.sel]||[];
+  h+='<div class="sh" style="margin-top:6px">成交明細 (輪詢取樣)</div>';
+  if(!tk.length)h+='<div style="padding:8px 10px;color:var(--muted)">等待成交…</div>';
+  tk.slice(0,18).forEach((x,i)=>{const pv=tk[i+1]?tk[i+1].p:q.prev;h+=`<div class="tk num"><span style="color:var(--muted)">${x.t}</span><span class="${dcls(x.p-pv)}">${fmtP(x.p)}</span><span>${fmtV(x.v)}</span></div>`});
+  el.innerHTML=h;
+}
+function renderToolbar(){
+  const anyMA=S.ma.some(m=>m.on);
+  const chip=(id,l,on)=>`<button class="${on?'on':''}" data-chip="${id}">${l}</button>`;
+  $('#tb').innerHTML=`<div class="g">${TFS.map(([k,l])=>`<button class="${st.tf===k?'on':''}" data-tf="${k}">${l}</button>`).join('')}</div>
+  <div class="g"><select id="ctSel" title="圖表類型">${CTYPES.map(([k,l])=>`<option value="${k}"${S.chartType===k?' selected':''}>${l}</option>`).join('')}</select></div>
+  <div class="g chips">${chip('ma','均線',anyMA)}${chip('boll','布林',S.boll.on)}${chip('vol','成交量',S.volume)}${chip('macd','MACD',S.macd.on)}${chip('kd','KD',S.kd.on)}${chip('rsi','RSI',S.rsi.on)}</div>
+  <div class="g"><button data-act="reset">↺ 重設縮放</button></div>
+  <span style="margin-left:auto;color:var(--muted);font-size:12px" id="srcTag"></span>`;
+  $('#srcTag').textContent=(st.src?('歷史：'+st.src+' · '):'')+'滾輪縮放 / 拖曳平移 / 雙擊還原';
+}
+function renderAlertBox(){
+  const a=st.alerts[st.sel]||{};
+  $('#alertBox').innerHTML=`🔔 到價提醒　漲到 ≥ <input id="alUp" type="number" step="0.01" value="${a.above??''}" placeholder="價格"> 跌到 ≤ <input id="alDn" type="number" step="0.01" value="${a.below??''}" placeholder="價格"> <button id="alSet">設定</button>`+
+    (a.above!=null?`<span class="tag" data-clr="above">≥${a.above} ✕</span>`:'')+(a.below!=null?`<span class="tag" data-clr="below">≤${a.below} ✕</span>`:'');
+}
+function toast(msg){const d=document.createElement('div');d.textContent=msg;$('#toast').appendChild(d);setTimeout(()=>d.remove(),9000)}
+function beep(){try{const a=new (window.AudioContext||window.webkitAudioContext)(),o=a.createOscillator(),g=a.createGain();o.connect(g);g.connect(a.destination);o.frequency.value=880;g.gain.value=.08;o.start();setTimeout(()=>{o.stop();a.close()},350)}catch(e){}}
+function checkAlerts(){
+  let ch=false;
+  for(const c in st.alerts){
+    const a=st.alerts[c],q=st.q[c],p=q&&q.price;if(p==null)continue;
+    const fire=m=>{const s=`${nameOf(c)} ${c} ${m} (現價 ${fmtP(p)})`;toast('🔔 '+s);beep();try{if(window.Notification&&Notification.permission==='granted')new Notification('台股到價提醒',{body:s})}catch(e){}ch=true};
+    if(a.above!=null&&p>=a.above){fire('已漲到 ≥ '+a.above);a.above=null}
+    if(a.below!=null&&p<=a.below){fire('已跌到 ≤ '+a.below);a.below=null}
+    if(a.above==null&&a.below==null)delete st.alerts[c];
+  }
+  if(ch){save();renderAlertBox()}
+}
+
+/* ---------- 事件 ---------- */
+function select(c){
+  if(st.sel===c&&st.bars.length)return;
+  st.sel=c;st.hover=null;save();renderAlertBox();renderWatch();renderHead();renderSide();loadHistory();
+  if(!st.q[c])pollQuotes();
+}
+$('#wl').addEventListener('click',e=>{
+  const x=e.target.closest('[data-x]');
+  if(x){const c=x.dataset.x;st.watch=st.watch.filter(w=>w.code!==c);if(st.sel===c&&st.watch.length)select(st.watch[0].code);save();renderWatch();e.stopPropagation();return}
+  const r=e.target.closest('tr.r');if(r)select(r.dataset.c);
+});
+$('#idx').addEventListener('click',e=>{const x=e.target.closest('.ix');if(x&&x.dataset.c)select(x.dataset.c)});
+$('#tb').addEventListener('click',e=>{
+  const b=e.target.closest('button');if(!b)return;
+  if(b.dataset.tf){st.tf=b.dataset.tf;save();renderToolbar();loadHistory();return}
+  if(b.dataset.act==='reset'){resetView();draw();return}
+  const c=b.dataset.chip;
+  if(c==='ma'){const on=!S.ma.some(m=>m.on);S.ma.forEach(m=>m.on=on)}
+  else if(c==='boll')S.boll.on=!S.boll.on;
+  else if(c==='vol')S.volume=!S.volume;
+  else if(c)S[c].on=!S[c].on;
+  changed();
+});
+$('#tb').addEventListener('change',e=>{if(e.target.id==='ctSel'){S.chartType=e.target.value;changed()}});
+$('#alertBox').addEventListener('click',e=>{
+  if(e.target.id==='alSet'){
+    const up=parseFloat($('#alUp').value),dn=parseFloat($('#alDn').value);
+    const a={above:isNaN(up)?null:up,below:isNaN(dn)?null:dn};
+    if(a.above==null&&a.below==null)delete st.alerts[st.sel];else st.alerts[st.sel]=a;
+    save();renderAlertBox();toast('已設定提醒');
+    try{if(window.Notification&&Notification.permission==='default')Notification.requestPermission()}catch(e){}
+  }
+  const t=e.target.closest('[data-clr]');
+  if(t){const a=st.alerts[st.sel];if(a){a[t.dataset.clr]=null;if(a.above==null&&a.below==null)delete st.alerts[st.sel];save();renderAlertBox()}}
+});
+/* 搜尋/新增 */
+const addIn=$('#addIn'),sug=$('#sug');let sugT,sugRes=[];
+function addStock(code,ex){
+  code=code.toUpperCase();
+  if(!st.watch.some(w=>w.code===code))st.watch.push({code,ex});
+  addIn.value='';sug.style.display='none';save();renderWatch();pollQuotes();select(code);
+}
+addIn.addEventListener('input',()=>{
+  clearTimeout(sugT);
+  sugT=setTimeout(async()=>{
+    const v=addIn.value.trim();if(!v){sug.style.display='none';return}
+    try{const j=await(await fetch('/api/search?q='+encodeURIComponent(v))).json();sugRes=j.results||[];
+      sug.innerHTML=sugRes.map(r=>`<div data-c="${r.code}" data-e="${r.ex}"><span>${r.code} ${r.name}</span><small>${r.ex==='otc'?'上櫃':'上市'}</small></div>`).join('');
+      sug.style.display=sugRes.length?'block':'none'}catch(e){}
+  },180);
+});
+addIn.addEventListener('keydown',e=>{
+  if(e.key==='Enter'){const v=addIn.value.trim();if(sugRes.length&&sug.style.display!=='none')addStock(sugRes[0].code,sugRes[0].ex);else if(/^[0-9A-Za-z]{2,8}$/.test(v))addStock(v)}
+  if(e.key==='Escape')sug.style.display='none';
+});
+sug.addEventListener('click',e=>{const d=e.target.closest('div[data-c]');if(d)addStock(d.dataset.c,d.dataset.e)});
+document.addEventListener('click',e=>{if(!e.target.closest('.add'))sug.style.display='none'});
+$('#refSel').value=String(S.refresh);
+$('#refSel').addEventListener('change',e=>{S.refresh=+e.target.value;save();pollQuotes()});
+$('#btnTheme').addEventListener('click',()=>{S.theme=S.theme==='dark'?'light':'dark';changed()});
+
+/* ---------- 設定面板 ---------- */
+const dlg=$('#dlg'),body=$('#dlgBody');
+const getP=p=>p.split('.').reduce((o,k)=>o[k],S);
+function setP(p,v){const ks=p.split('.'),l=ks.pop();ks.reduce((o,k)=>o[k],S)[l]=v}
+const chk=(p,l)=>`<div class="f"><label class="k"><input type="checkbox" data-p="${p}" ${getP(p)?'checked':''}>${l}</label></div>`;
+const num=(p,l,min,max,step)=>`<div class="f"><span>${l}</span><input type="number" data-p="${p}" value="${getP(p)}" min="${min}" max="${max}" step="${step||1}"></div>`;
+const col=(p,l)=>`<div class="f"><span>${l}</span><input type="color" data-p="${p}" value="${getP(p)}"></div>`;
+const sel=(p,l,opts)=>`<div class="f"><span>${l}</span><select data-p="${p}">${opts.map(([v,t])=>`<option value="${v}"${getP(p)==v?' selected':''}>${t}</option>`).join('')}</select></div>`;
+function buildDlg(){
+  const line=(arr,i,name)=>`<div class="row"><label class="k"><input type="checkbox" data-p="${arr}.${i}.on" ${getP(arr+'.'+i+'.on')?'checked':''}> <span class="n">${name}${i+1}</span></label>週期 <input type="number" data-p="${arr}.${i}.p" min="1" max="500" value="${getP(arr+'.'+i+'.p')}"> 顏色 <input type="color" data-p="${arr}.${i}.color" value="${getP(arr+'.'+i+'.color')}"></div>`;
+  body.innerHTML=`
+  <h4>一般</h4><div class="grid">
+   ${sel('theme','介面主題',[['dark','暗色'],['light','亮色']])}
+   ${sel('scheme','漲跌顏色',[['tw','台股：紅漲綠跌'],['us','美股：綠漲紅跌']])}
+   ${num('refresh','報價更新(秒)',2,120)}
+  </div>
+  <h4>自選股表格欄位</h4><div class="grid">
+   ${chk('cols.open','開盤')}${chk('cols.high','最高')}${chk('cols.low','最低')}${chk('cols.prev','昨收')}${chk('cols.bid','買進價')}${chk('cols.ask','賣出價')}${chk('cols.vol','成交量(張)')}
+  </div>
+  <h4>線圖外觀</h4><div class="grid">
+   ${sel('chartType','K線類型',CTYPES)}
+   ${sel('rtType','分時圖樣式',[['area','面積'],['line','線']])}
+   ${num('lineWidth','線寬',0.5,4,0.5)}
+   ${col('lineColor','線圖顏色')}
+   ${num('bodyRatio','K棒寬度比例',0.2,1,0.05)}
+   ${num('barsDefault','預設顯示K棒數',20,500,10)}
+   ${chk('grid','顯示格線')}${chk('crosshair','十字游標')}${chk('infoBar','顯示資訊列(OHLC/均線值)')}
+   ${chk('lastLine','現價虛線')}${chk('hiLo','標示區間最高/最低')}${chk('logScale','對數座標(K線)')}
+  </div>
+  <h4>主圖疊加：移動平均線 (SMA)</h4>${S.ma.map((_,i)=>line('ma',i,'MA')).join('')}
+  <h4>主圖疊加：指數移動平均線 (EMA)</h4>${S.ema.map((_,i)=>line('ema',i,'EMA')).join('')}
+  <h4>主圖疊加：布林通道</h4><div class="grid">${chk('boll.on','啟用')}${num('boll.p','週期',2,200)}${num('boll.k','標準差倍數',0.5,5,0.5)}${col('boll.color','顏色')}</div>
+  <h4>副圖指標</h4><div class="grid">
+   ${chk('volume','成交量')}<span></span><span></span>
+   ${chk('macd.on','MACD')}${num('macd.f','快線',1,100)}${num('macd.s','慢線',1,200)}${num('macd.g','訊號線',1,100)}
+   ${chk('kd.on','KD 隨機指標')}${num('kd.n','週期',1,100)}<span></span>
+   ${chk('rsi.on','RSI')}${num('rsi.p','週期',1,100)}
+  </div>`;
+}
+function changed(){save();applyTheme();recalc();renderToolbar();renderWatch();renderIdx();$('#refSel').value=String(S.refresh);draw()}
+dlg.addEventListener('input',e=>{
+  const t=e.target,p=t.dataset&&t.dataset.p;if(!p)return;
+  let v=t.type==='checkbox'?t.checked:t.type==='number'?parseFloat(t.value):t.value;
+  if(t.type==='number'){if(isNaN(v))return;if(t.min!==''&&v<+t.min)v=+t.min;if(t.max!==''&&v>+t.max)v=+t.max}
+  if(t.tagName==='SELECT'&&typeof getP(p)==='number')v=+v;
+  const oldRef=S.refresh;setP(p,v);
+  if(p==='barsDefault'){resetView()}
+  changed();if(S.refresh!==oldRef)pollQuotes();
+});
+$('#btnSet').addEventListener('click',()=>{buildDlg();dlg.showModal()});
+$('#btnClose').addEventListener('click',()=>dlg.close());
+$('#btnReset').addEventListener('click',()=>{const d=JSON.parse(JSON.stringify(DEF));Object.keys(S).forEach(k=>delete S[k]);Object.assign(S,d);buildDlg();changed();resetView();pollQuotes()});
+dlg.addEventListener('click',e=>{if(e.target===dlg)dlg.close()});
+
+/* ---------- 啟動 ---------- */
+applyTheme();renderToolbar();renderWatch();renderAlertBox();renderMkt();
+fetch('/api/info').then(r=>r.json()).then(j=>{st.demo=!!j.demo;if(st.demo)$('#demoTag').style.display='inline-block';renderMkt()}).catch(()=>{});
+pollQuotes();loadHistory();
+setInterval(renderMkt,1000);
+window.addEventListener('resize',draw);
+})();
+</script>
 </body>
 </html>
+'''
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def reply(self, code, body, ctype="application/json; charset=utf-8"):
+        if not isinstance(body, bytes):
+            body = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        u = urllib.parse.urlparse(self.path)
+        q = urllib.parse.parse_qs(u.query)
+        one = lambda k, d="": (q.get(k) or [d])[0]
+        try:
+            if u.path in ("/", "/index.html"):
+                self.reply(200, HTML.encode("utf-8"), "text/html; charset=utf-8")
+            elif u.path == "/api/info":
+                self.reply(200, {"demo": DEMO})
+            elif u.path == "/api/quote":
+                codes = [c for c in one("codes").split(",") if re.fullmatch(r"[0-9A-Za-z]{1,8}", c)][:80]
+                self.reply(200, {"quotes": get_quotes(codes)})
+            elif u.path == "/api/history":
+                code, tf = one("code"), one("tf", "D")
+                ex = one("ex")
+                if not re.fullmatch(r"[0-9A-Za-z]{1,8}", code):
+                    raise ValueError("bad code")
+                self.reply(200, get_history(code, ex, tf))
+            elif u.path == "/api/search":
+                self.reply(200, {"results": search(one("q"))})
+            else:
+                self.reply(404, {"error": "not found"})
+        except Exception as e:
+            self.reply(502, {"error": "%s: %s" % (type(e).__name__, e)})
+
+
+def main():
+    global DEMO, CTX
+    ap = argparse.ArgumentParser(description="台股即時看盤")
+    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--host", default="127.0.0.1", help="預設只開放本機")
+    ap.add_argument("--demo", action="store_true", help="示範模式 (假資料，不連網)")
+    ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--insecure", action="store_true", help="略過 SSL 憑證驗證 (macOS 憑證問題時使用)")
+    a = ap.parse_args()
+    DEMO = a.demo
+    if a.insecure:
+        CTX = ssl._create_unverified_context()
+    srv = ThreadingHTTPServer((a.host, a.port), Handler)
+    url = "http://%s:%d/" % ("127.0.0.1" if a.host in ("0.0.0.0", "") else a.host, a.port)
+    print("台股即時看盤已啟動：%s %s" % (url, "(示範模式)" if DEMO else ""))
+    print("按 Ctrl+C 結束")
+    if not a.no_browser:
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\n已結束")
+
+
+if __name__ == "__main__":
+    main()
